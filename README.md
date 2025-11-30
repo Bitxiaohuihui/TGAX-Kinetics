@@ -105,7 +105,7 @@ If you use TGAX-Kinetics in your research, please cite the following paper:
 
 > **Xing, X., Li, S., & Liu, J.** (2025). TGAX Kinetics: An Open-Source Python Framework for Non-Isothermal Kinetic Analysis of Hydrogen Storage Materials. *[Submitted/Journal Name]*.
 
-*(If available, please also include the Zenodo DOI for the specific version of the code used).*
+[![DOI](https://zenodo.org/badge/1107020370.svg)](https://doi.org/10.5281/zenodo.17769287)
 
 ## 📜 License
 
@@ -114,3 +114,4 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 ---
 
 *Developed at the School of Materials Science and Engineering, Beijing Institute of Technology.*
+
