@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.xxxxxx.svg)](https://doi.org/10.5281/zenodo.xxxxxx)
+[![DOI](https://zenodo.org/badge/1107020370.svg)](https://doi.org/10.5281/zenodo.17769287)
 
 ## 📖 Overview
 
@@ -112,4 +112,5 @@ If you use TGAX-Kinetics in your research, please cite the following paper:
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details. This permissive license allows for reuse, modification, and distribution for both academic and commercial purposes, provided the original copyright notice is retained.
 
 ---
+
 *Developed at the School of Materials Science and Engineering, Beijing Institute of Technology.*
