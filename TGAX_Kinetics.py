@@ -1125,17 +1125,33 @@ class App(tk.Tk):
         self.is_task_running = False
         self.menu_states = {}
 
-        ### MODIFICATION START: Added m0/m_inf attributes ###
-        self.dfs, self.plots, self.fit_results, self.cka_results, self.preprocessed_files, self.sample_masses = {}, {}, None, None, {}, {}
-        self.mass_loss_parameters = {} # Stores {beta: (m0, m_inf)}
+        ### MODIFICATION START: Added storage for all analysis types ###
+        self.dfs, self.plots = {}, {}
+        
+        # HISTORY STORAGE: Stores every fit result dictionary in a list
+        self.fit_history = [] 
+        
+        # MECHANISM COMPARISON STORAGE
+        self.mech_ranking = None
+        self.mech_comparison_data = None
+        
+        # Single-state results (keep for backward compatibility)
+        self.fit_results, self.cka_results = None, None
+        self.autocatalytic_results = None
+        self.npa_results = None
+        self.conversion_time_df = None
+        self.tg_dtg_results = None 
+        self.dsc_results = None
+        
+        self.preprocessed_files, self.sample_masses = {}, {}
+        self.mass_loss_parameters = {} 
+        self.last_fitted_model = None
         ### MODIFICATION END ###
         
-        self.autocatalytic_results = None
-        self.npa_results = None # <--- ### MODIFICATION START ###
         # --- MODIFICATION START: New attribute for storing the last fitted model ---
-        
-        self.last_fitted_model = None 
+        self.last_fitted_model = None
         # --- MODIFICATION END ---
+        ### MODIFICATION END ###
         self.autocatalytic_model_definitions = {
             "SB": ("Generalized Sestak-Berggren (SB)", "dα/dt = A·exp(-E/RT)·αᵐ(1-α)ⁿ[-ln(1-α)]ᵖ"),
             "KS": ("Kamal–Sourour (KS)", "dα/dt = [A₁exp(-E₁/RT) + A₂exp(-E₂/RT)·αᵐ](1-α)ⁿ"),
@@ -2063,6 +2079,7 @@ class App(tk.Tk):
 
     def _on_global_fit_success(self, results):
         self.fit_results = results
+        self.fit_history.append(results)
         self.last_fitted_model = {
             "model_name": "GlobalFit", "params": self.fit_results['params'],
             "raw_params": self.fit_results['raw_params'], "cov": self.fit_results['cov'],
@@ -2513,6 +2530,7 @@ class App(tk.Tk):
 
     def _on_autocatalytic_fit_success(self, results):
         self.autocatalytic_results = results
+        self.fit_history.append(results)
         self.last_fitted_model = { "model_name": results['model_name'], "params": self.autocatalytic_results['params'],
             "raw_params": self.autocatalytic_results['raw_params'], "cov": self.autocatalytic_results.get('cov', np.nan),
             "param_order": self.autocatalytic_results.get('param_order', []), "source": "Autocatalytic Fit" }
@@ -2743,6 +2761,7 @@ class App(tk.Tk):
         
     def _on_cka_success(self, results):
         self.cka_results = results
+        self.fit_history.append(results)
         self.last_fitted_model = { "model_name": self.cka_results['model_name'], "params": self.cka_results['params'],
             "raw_params": self.cka_results['raw_params'], "cov": self.cka_results['cov'],
             "param_order": self.cka_results['param_order'], "source": "Combined Kinetic Analysis" }
@@ -2907,6 +2926,8 @@ class App(tk.Tk):
                 ranking_results.append({'Model Code': model_code, 'Model Name': IDEAL_MODELS[model_code][0], 'R-squared': r2})
             
             ranking_df = pd.DataFrame(ranking_results).sort_values(by='R-squared', ascending=False).reset_index(drop=True)
+            self.mech_ranking = ranking_df
+            self.mech_comparison_data = comparison_df
 
         ranking_frame = ttk.LabelFrame(main_frame, text="Goodness-of-Fit Ranking", padding="10", style="Modern.TLabelframe")
         ranking_frame.pack(fill="x", expand=False, pady=(0, 15))
@@ -2980,19 +3001,15 @@ class App(tk.Tk):
         T0_K = settings["T0"]
         model_info = self.last_fitted_model
         
-        ### MODIFICATION START ###
         model_name = model_info.get("model_name", "")
         
-        # Check if the model is Non-Parametric (NPA) or a Fixed Ea CKA.
-        # - NPA: No covariance matrix.
-        # - CKA (Fixed Ea): A 4x4 covariance matrix that is incompatible with the 5-param error logic.
-        # In both cases, we must skip the error propagation.
-        if model_name == "NPA" or model_name == "CKA (Fixed Ea)":
+        # MODIFICATION: Only NPA is excluded from error propagation because it lacks a parametric form.
+        # "CKA (Fixed Ea)" and "GlobalFit" are now routed to the _with_error function 
+        # where the Ea variance will be manually injected.
+        if model_name == "NPA":
             self.status_var.set(f"Running Prediction for {model_name} (no CI)...")
             conversion_time_df = self.predict_cumulative_conversion_time(model_info, T0_K)
-        ### MODIFICATION END ###
         else:
-            # Original path for parametric models (GAI, original CKA, etc.)
             self.status_var.set(f"Running Prediction for {model_name} (with CI)...")
             conversion_time_df = self.predict_cumulative_conversion_time_with_error(model_info, T0_K)
         
@@ -3072,78 +3089,202 @@ class App(tk.Tk):
         return None
 
     def predict_cumulative_conversion_time_with_error(self, model_info, T0_K):
+        # 1. Retrieve initial information & Convert types immediately
         raw_params = model_info.get('raw_params')
         cov_matrix = model_info.get('cov')
         param_order = model_info.get('param_order')
+        model_name = model_info.get('model_name', '')
 
-        if raw_params is None or cov_matrix is None or param_order is None or np.isnan(cov_matrix).any():
-             messagebox.showwarning("Error Propagation Disabled", 
-                                  "Covariance matrix is missing or invalid for this model fit. "
-                                  "Prediction will proceed without confidence intervals.", parent=self)
+        # Basic Validation
+        if raw_params is None or cov_matrix is None or param_order is None:
+             messagebox.showwarning("Error", "Model parameters missing.", parent=self)
+             return self.predict_cumulative_conversion_time(model_info, T0_K)
+        
+        # Ensure numpy arrays
+        cov_matrix = np.array(cov_matrix, dtype=float)
+        raw_params = np.array(raw_params, dtype=float)
+        
+        if np.isnan(cov_matrix).any():
+             messagebox.showwarning("Warning", "Covariance matrix contains NaNs.", parent=self)
              return self.predict_cumulative_conversion_time(model_info, T0_K)
 
-        def get_rate_and_derivatives(alpha, params_vec):
-            rate = 0; grad = np.zeros_like(params_vec)
-            p_map = {name: val for name, val in zip(param_order, params_vec)}
+        # --- STEP 2: MATRIX DIMENSION FIX (For CKA/GlobalFit) ---
+        n_cov = cov_matrix.shape[0]
+        n_params = len(raw_params)
+        
+        # If parameters (5) > covariance matrix (4), we MUST expand the matrix
+        if n_params > n_cov:
+            # Create a new, larger matrix
+            new_cov = np.zeros((n_params, n_params))
+            # Copy the old matrix into the top-left corner
+            # We take min dimensions to be safe
+            d = min(n_cov, n_params)
+            new_cov[:d, :d] = cov_matrix[:d, :d]
             
-            alpha = np.clip(alpha, EPS, 1 - EPS); a1 = 1 - alpha
-
-            if 'p' in p_map and ('Ea_J' in p_map or 'logA' in p_map):
-                m, n, p_ = p_map.get('m',0), p_map.get('n',0), p_map.get('p',0)
-                logA = p_map.get('logA',0)
-                A = np.exp(logA)
+            # If we are missing Ea variance (common in CKA), inject it
+            if 'Ea_J' in param_order or n_params == 5:
+                idx_ea = n_params - 1 # Assuming Ea is last
+                if 'Ea_J' in param_order:
+                    try: idx_ea = param_order.index('Ea_J')
+                    except: pass
                 
-                if model_info.get('Ea_source') == 'isoconversional':
-                    ea_ser = self.ea.set_index("alpha")["Ea_kJ_per_mol"] * 1000
-                    Ea_J = np.interp(alpha, ea_ser.index, ea_ser.values)
-                else:
-                    Ea_J = p_map.get('Ea_J',0)
+                # Get Ea error from info, default to 0 if missing
+                ea_err = model_info.get('errors', {}).get('Ea_kJ_per_mol', 0)
+                if pd.isna(ea_err): ea_err = 0.0
+                new_cov[idx_ea, idx_ea] = (ea_err * 1000.0)**2
+            
+            cov_matrix = new_cov # Update to the corrected 5x5 matrix
 
-                exp_term = np.exp(-Ea_J / (R * T0_K))
-                f_alpha = (alpha**m) * (a1**n) * ((-np.log(a1))**p_)
-                rate = (A/60) * exp_term * f_alpha # rate in 1/sec
-                if abs(rate) > 1e-20:
-                    if 'm' in param_order: grad[param_order.index('m')] = rate * np.log(alpha)
-                    if 'n' in param_order: grad[param_order.index('n')] = rate * np.log(a1)
-                    if 'p' in param_order: grad[param_order.index('p')] = rate * np.log(-np.log(a1))
+        # --- STEP 3: DERIVATIVE FUNCTION (GRADIENT) ---
+        def get_rate_and_derivatives(alpha, params_vec):
+            # params_vec matches param_order
+            rate = 0.0
+            grad = np.zeros_like(params_vec)
+            
+            # Map params for easy access
+            p = {name: val for name, val in zip(param_order, params_vec)}
+            
+            alpha = np.clip(alpha, 1e-6, 1 - 1e-6); a1 = 1 - alpha
+            RT = R * T0_K
+
+            # === CASE A: PARAMETRIC MODELS (CKA, SB, GlobalFit) ===
+            if 'p' in p and ('logA' in p):
+                m, n, p_val = p.get('m',0), p.get('n',0), p.get('p',0)
+                logA = p.get('logA', 0)
+                
+                # Ea handling
+                Ea_val = 0
+                if 'Ea_J' in p: Ea_val = p['Ea_J']
+                elif model_info.get('Ea_source') == 'isoconversional':
+                    # Interpolate Ea for rate calc, but derivative w.r.t fixed Ea is 0 here
+                    # unless we are in GlobalFit mode where it matters.
+                    # For simplicity in error prop, we use mean Ea if variable
+                    Ea_val = model_info['params'].get('Ea_kJ_per_mol', 0) * 1000.0
+
+                A = np.exp(logA)
+                k = (A / 60.0) * np.exp(-Ea_val / RT) # rate constant in 1/sec
+                
+                with np.errstate(all='ignore'):
+                    ln_a1 = np.log(a1)
+                    term_p = (-ln_a1)**p_val if p_val != 0 else 1.0
+                    f_alpha = (alpha**m) * (a1**n) * term_p
+                
+                rate = k * f_alpha
+                
+                # Derivatives (Chain Rule)
+                if abs(rate) > 1e-30:
                     if 'logA' in param_order: grad[param_order.index('logA')] = rate
-                    if 'Ea_J' in param_order: grad[param_order.index('Ea_J')] = rate * (-1 / (R * T0_K))
-            else:
-                 rate = self._get_autocatalytic_rate(alpha, T0_K, model_info) or 0
+                    if 'Ea_J' in param_order: grad[param_order.index('Ea_J')] = rate * (-1.0/RT)
+                    if 'm' in param_order:    grad[param_order.index('m')]    = rate * np.log(alpha)
+                    if 'n' in param_order:    grad[param_order.index('n')]    = rate * ln_a1
+                    if 'p' in param_order and abs(ln_a1) > 1e-6:
+                         grad[param_order.index('p')] = rate * np.log(-ln_a1)
+
+            # === CASE B: GAI MODEL (FIX FOR YOUR ISSUE) ===
+            elif model_name == "GAI":
+                # param_order: ['logA', 'E_J', 'n1', 'z0', 'n2']
+                logA, E_J = p['logA'], p['E_J']
+                n1, z0, n2 = p['n1'], p['z0'], p['n2']
+                
+                A = np.exp(logA)
+                k = (A / 60.0) * np.exp(-E_J / RT)
+                
+                term_cat = z0 + alpha**n2
+                f_alpha = (a1**n1) * term_cat
+                rate = k * f_alpha
+                
+                if abs(rate) > 1e-30:
+                    # d(rate)/d(logA) = rate
+                    grad[param_order.index('logA')] = rate
+                    # d(rate)/d(E) = rate * (-1/RT)
+                    grad[param_order.index('E_J')] = rate * (-1.0/RT)
+                    # d(rate)/d(n1) = rate * ln(1-alpha)
+                    grad[param_order.index('n1')] = rate * np.log(a1)
+                    # d(rate)/d(z0) = k * (1-alpha)^n1
+                    grad[param_order.index('z0')] = k * (a1**n1)
+                    # d(rate)/d(n2) = k * (1-alpha)^n1 * alpha^n2 * ln(alpha)
+                    if alpha > 1e-6:
+                        grad[param_order.index('n2')] = k * (a1**n1) * (alpha**n2) * np.log(alpha)
+
+            # === CASE C: KAMAL-SOUROUR ===
+            elif model_name == "Kamal-Sourour":
+                # param_order: ['logA1', 'E1_J', 'logA2', 'E2_J', 'm', 'n']
+                k1 = (np.exp(p['logA1'])/60.0) * np.exp(-p['E1_J']/RT)
+                k2 = (np.exp(p['logA2'])/60.0) * np.exp(-p['E2_J']/RT)
+                
+                term_m = alpha**p['m']
+                term_n = a1**p['n']
+                rate = (k1 + k2 * term_m) * term_n
+                
+                # Partial derivatives are complex here, simplified check:
+                if abs(rate) > 1e-30:
+                    # d/d(logA1) = k1 * term_n
+                    grad[param_order.index('logA1')] = k1 * term_n
+                    grad[param_order.index('E1_J')]  = k1 * term_n * (-1.0/RT)
+                    # d/d(logA2) = k2 * term_m * term_n
+                    grad[param_order.index('logA2')] = k2 * term_m * term_n
+                    grad[param_order.index('E2_J')]  = k2 * term_m * term_n * (-1.0/RT)
+                    
+            # === CASE D: PARALLEL ===
+            elif model_name == "PAR":
+                 # param_order: ['logA1', 'E1_J', 'n1', 'logA2', 'E2_J', 'n2']
+                 k1 = (np.exp(p['logA1'])/60.0) * np.exp(-p['E1_J']/RT)
+                 k2 = (np.exp(p['logA2'])/60.0) * np.exp(-p['E2_J']/RT)
+                 r1 = k1 * (a1**p['n1'])
+                 r2 = k2 * (a1**p['n2'])
+                 rate = r1 + r2
+                 
+                 if abs(rate) > 1e-30:
+                     grad[param_order.index('logA1')] = r1
+                     grad[param_order.index('E1_J')]  = r1 * (-1.0/RT)
+                     grad[param_order.index('n1')]    = r1 * np.log(a1)
+                     grad[param_order.index('logA2')] = r2
+                     grad[param_order.index('E2_J')]  = r2 * (-1.0/RT)
+                     grad[param_order.index('n2')]    = r2 * np.log(a1)
+
             return rate, grad
 
-        def integrand_builder(param_idx_to_diff):
+        # --- STEP 4: INTEGRATION (Unchanged logic, just ensure using new matrix) ---
+        def integrand_builder(param_idx):
             def integrand(alpha):
                 rate, grad = get_rate_and_derivatives(alpha, raw_params)
                 if abs(rate) < 1e-30: return 0.0
-                partial_deriv_rate = grad[param_idx_to_diff]
-                return -1.0 / (rate**2) * partial_deriv_rate
+                # sensitivity of time = -1/rate^2 * sensitivity of rate
+                return -1.0 / (rate**2) * grad[param_idx]
             return integrand
 
         alpha_points = np.linspace(0.01, 0.99, 50)
         time_points_sec, time_variance = [], []
         
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", integrate.IntegrationWarning)
+            warnings.simplefilter("ignore")
             for alpha_target in alpha_points:
-                integrand_t = lambda a: 1.0 / (get_rate_and_derivatives(a, raw_params)[0] + 1e-30)
-                time_sec, _ = quad(integrand_t, EPS, alpha_target)
-                time_points_sec.append(time_sec)
-                grad_t_alpha = np.zeros_like(raw_params)
-                for i in range(len(raw_params)):
-                    integrand_func = integrand_builder(i)
-                    partial_t_alpha, _ = quad(integrand_func, EPS, alpha_target)
-                    grad_t_alpha[i] = partial_t_alpha
-                J = grad_t_alpha
+                # Time
+                t_func = lambda a: 1.0 / (get_rate_and_derivatives(a, raw_params)[0] + 1e-30)
+                t_sec, _ = quad(t_func, 1e-6, alpha_target)
+                time_points_sec.append(t_sec)
+                
+                # Jacobian
+                J = np.zeros(n_params)
+                for i in range(n_params):
+                    J[i], _ = quad(integrand_builder(i), 1e-6, alpha_target)
+                
+                # Variance: J^T * Cov * J
+                # Important: Use the CORRECTED cov_matrix from Step 2
                 var = J.T @ cov_matrix @ J
                 time_variance.append(var)
 
+        # Output Construction
         df = pd.DataFrame({"alpha": alpha_points, "t_alpha_sec": np.array(time_points_sec), "t_alpha_var": np.array(time_variance)})
         df['t_alpha_std_err'] = np.sqrt(df['t_alpha_var'])
         df['t_alpha_days'] = df['t_alpha_sec'] / 86400.0
-        df['ci_lower_days'] = (df['t_alpha_sec'] - 1.96 * df['t_alpha_std_err']) / 86400.0
-        df['ci_upper_days'] = (df['t_alpha_sec'] + 1.96 * df['t_alpha_std_err']) / 86400.0
+        
+        # 95% CI
+        z_score = 1.96
+        df['ci_lower_days'] = (df['t_alpha_sec'] - z_score * df['t_alpha_std_err']) / 86400.0
+        df['ci_upper_days'] = (df['t_alpha_sec'] + z_score * df['t_alpha_std_err']) / 86400.0
         df['ci_lower_days'] = df['ci_lower_days'].clip(lower=0)
+        
         return df
 
     def predict_cumulative_conversion_time(self, model_info, T0_K):
@@ -3243,50 +3384,179 @@ class App(tk.Tk):
         df['ci_lower_days'] = np.nan; df['ci_upper_days'] = np.nan
         return df
     
-    def _add_plot_to_doc(self, doc, plot_type):
-        fig, ax = plt.subplots(figsize=(12/2.54, 9/2.54))
-        if plot_type == 'Ea':
-            ax.errorbar(self.ea["alpha"], self.ea["Ea_kJ_per_mol"], yerr=self.ea["StdErr_kJ"], fmt='-o', capsize=3)
-            ax.set_xlabel(r"Conversion, $\alpha$"); ax.set_ylabel(r"Activation Energy, $E_\mathrm{a}$ (kJ mol$^{-1}$)")
-        elif plot_type == 'ConversionTime':
-            ax.plot(self.conversion_time_df["alpha"], self.conversion_time_df["t_alpha_days"], "o-", label="Prediction")
-            ax.fill_between(self.conversion_time_df["alpha"], self.conversion_time_df["ci_lower_days"], self.conversion_time_df["ci_upper_days"], alpha=0.2, label="95% CI")
-            ax.set_xlabel(r"Conversion, $\alpha$"); ax.set_ylabel("Conversion Time, $t_\\mathrm{a}$ (days)")
-            min_val, max_val = self.conversion_time_df["t_alpha_days"].min(), self.conversion_time_df["t_alpha_days"].max()
-            if min_val > 0 and max_val / min_val > 100: ax.set_yscale('log'); ax.set_ylabel("Conversion Time, $t_\\mathrm{a}$ (days) [log scale]")
-            ax.legend()
-        fig.tight_layout(pad=0.5); memfile = io.BytesIO(); fig.savefig(memfile, format='png', dpi=300); memfile.seek(0)
-        doc.add_picture(memfile, width=Cm(12)); doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
-        plt.close(fig)
+    # =========================================================================
+    # ====================  IMPROVED REPORT GENERATOR  ========================
+    # =========================================================================
 
     def save_report(self):
-        if self.is_task_running: return messagebox.showwarning("Busy", "Please wait for the current task to finish.")
-        if self.ea is None: return messagebox.showwarning("No Data", "No data to export.")
-        p = filedialog.asksaveasfilename(defaultextension=".docx", initialfile="TGA_Kinetic_Report_v1.0.docx", filetypes=[("Word Document", "*.docx")])
+        if self.is_task_running: 
+            return messagebox.showwarning("Busy", "Please wait for the current task to finish.")
+        
+        # MODIFICATION: Check if ANY data exists, not just Ea
+        has_data = any(x is not None for x in [self.ea, self.tg_dtg_results, self.dsc_results])
+        if not has_data: 
+            return messagebox.showwarning("No Data", "No analysis results to export.")
+            
+        p = filedialog.asksaveasfilename(
+            defaultextension=".docx", 
+            initialfile="TGA_Kinetic_Report_v1.0.docx", 
+            filetypes=[("Word Document", "*.docx")]
+        )
         if not p: return
+        
         self._start_task(self._save_report_worker, p, on_success=lambda p: messagebox.showinfo("Success", f"Report saved to {p}"))
 
-    def _save_report_worker(self, path):
-        doc = Document(); doc.add_heading("Kinetic Analysis Report", 0)
-        doc.add_heading("Activation Energy Calculation", level=1)
-        equations = {"Friedman": "ln(β · dα/dT) = ln[A · f(α)] - Eₐ / (R · T)","KAS": "ln(β / T²) = ln(A·R / (Eₐ · g(α))) - Eₐ / (R · T)","OFW": "ln(β) = ln(A · Eₐ / (R · g(α))) - 5.331 - 1.052 · Eₐ / (R · T)","Vyazovkin": "Advanced non-linear isoconversional method"}
-        equations = {"Friedman": "ln(β · dα/dt) = ln[A · f(α)] - Eₐ / (R · T)","KAS": "ln(β / T²) = ln(A·R / (Eₐ · g(α))) - Eₐ / (R · T)","OFW": "ln(β) = ln(A · Eₐ / (R · g(α))) - 5.331 - 1.052 · Eₐ / (R · T)","Vyazovkin": "Advanced non-linear isoconversional method"}
-        doc.add_paragraph(f"The activation energy (Eₐ) was calculated using the {self.current_method} method.")
-        doc.add_paragraph(f"Principle: {equations.get(self.current_method, 'N/A')}")
-        doc.add_heading("Activation Energy vs. Conversion", level=2); self._add_plot_to_doc(doc, 'Ea')
-        ea_display = self.ea.rename(columns=self.display_header_map)
-        tbl = doc.add_table(rows=1, cols=len(ea_display.columns), style='Table Grid')
-        for j, c in enumerate(ea_display.columns): tbl.cell(0, j).text = str(c)
-        for _, r in ea_display.iterrows():
-            row_cells = tbl.add_row().cells
-            for j, v in enumerate(r): row_cells[j].text = f"{v:.5g}" if isinstance(v, (float, int)) else str(v)
-        if self.conversion_time_df is not None and not self.conversion_time_df.empty:
-            doc.add_heading("Conversion Time Prediction Results", level=1)
-            model_source = self.last_fitted_model.get("source", "the fitted model")
-            doc.add_paragraph(f"The isothermal conversion time (tₐ) was predicted by numerically integrating the rate equation derived from {model_source}. Uncertainty was propagated using a first-order Taylor expansion of the parameter covariance matrix to establish a 95% confidence interval (CI).")
-            doc.add_heading("Predicted Conversion Time vs. Conversion (with 95% CI)", level=2); self._add_plot_to_doc(doc, 'ConversionTime')
-        doc.save(path); return Path(path).name
+    def _add_dataframe_to_doc(self, doc, df, title=None):
+        """NEW HELPER: Add a Pandas DataFrame as a formatted Word table."""
+        if title:
+            doc.add_heading(title, level=3)
+        
+        # Reset index if it's meaningful (like parameter names in fit results)
+        # But don't reset if it's just a range index (0, 1, 2...)
+        if df.index.name and df.index.name != 'index':
+            df = df.reset_index()
+            
+        table = doc.add_table(rows=1, cols=len(df.columns))
+        table.style = 'Table Grid'
+        
+        # Header
+        hdr_cells = table.rows[0].cells
+        for i, col_name in enumerate(df.columns):
+            hdr_cells[i].text = str(col_name)
+            
+        # Rows
+        for _, row in df.iterrows():
+            row_cells = table.add_row().cells
+            for i, val in enumerate(row):
+                if isinstance(val, (float, int)):
+                    # Format numbers nicely (5 sig figs)
+                    row_cells[i].text = f"{val:.5g}"
+                else:
+                    row_cells[i].text = str(val)
+        doc.add_paragraph() # Spacer
 
+    def _add_plot_to_doc(self, doc, plot_type, data_source=None):
+        """Generates a plot in memory and adds it to the Word doc."""
+        fig, ax = plt.subplots(figsize=(14/2.54, 10/2.54))
+        
+        if plot_type == 'Ea':
+            ax.errorbar(self.ea["alpha"], self.ea["Ea_kJ_per_mol"], yerr=self.ea["StdErr_kJ"], fmt='-o', capsize=3)
+            ax.set_xlabel(r"Conversion, $\alpha$")
+            ax.set_ylabel(r"Activation Energy, $E_\mathrm{a}$ (kJ mol$^{-1}$)")
+            
+        elif plot_type == 'ConversionTime':
+            ax.plot(self.conversion_time_df["alpha"], self.conversion_time_df["t_alpha_days"], "o-", label="Prediction")
+            if "ci_lower_days" in self.conversion_time_df.columns:
+                ax.fill_between(self.conversion_time_df["alpha"], self.conversion_time_df["ci_lower_days"], 
+                              self.conversion_time_df["ci_upper_days"], alpha=0.2, label="95% CI")
+            ax.set_xlabel(r"Conversion, $\alpha$")
+            ax.set_ylabel("Conversion Time (days)")
+            ax.set_yscale('log')
+            ax.legend()
+            
+        elif plot_type == 'ModelFit':
+            # Handle fit history plots
+            params = data_source['params']
+            model_name = data_source.get('model_name', 'Model')
+            for beta, df in self.dfs.items():
+                rate_exp = df['dAdT'] * beta 
+                p = ax.plot(df['Temp_K'], rate_exp, 'o', ms=2, alpha=0.4, label=f"{beta} (Exp)")
+                color = p[0].get_color()
+                rate_calc = self._predict_rate_from_fit(data_source, df)
+                ax.plot(df['Temp_K'], rate_calc, '-', color=color, lw=1.5)
+            ax.set_xlabel("Temperature (K)")
+            ax.set_ylabel(r"Rate, $d\alpha/dt$ (min$^{-1}$)")
+            ax.set_title(f"Fit Comparison: {model_name}")
+            
+        elif plot_type == 'NPA':
+            ax.plot(self.npa_results['alpha'], self.npa_results['log_Z_alpha'], 'o-', color='purple')
+            ax.set_xlabel(r"Conversion, $\alpha$")
+            ax.set_ylabel(r"$\log_{10}(Z(\alpha))$")
+
+        # === NEW: Mechanism Comparison Plot ===
+        elif plot_type == 'MechComp':
+            df = self.mech_comparison_data
+            for col in df.columns:
+                if col == 'alpha': continue
+                if 'Experimental' in col:
+                    ax.plot(df['alpha'], df[col], 'p', color='black', label='Exp')
+                else:
+                    ax.plot(df['alpha'], df[col], label=col)
+            ax.set_ylabel(r"$f(\alpha)/f(0.5)$")
+            ax.set_xlabel(r"$\alpha$")
+            ax.legend(fontsize=8)
+
+        fig.tight_layout()
+        memfile = io.BytesIO()
+        fig.savefig(memfile, format='png', dpi=300)
+        memfile.seek(0)
+        doc.add_picture(memfile, width=Cm(14))
+        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        plt.close(fig)
+
+    def _save_report_worker(self, path):
+        doc = Document()
+        doc.add_heading("Comprehensive Kinetic Analysis Report", 0)
+        doc.add_paragraph(f"Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        
+        # 1. ISOCONVERSIONAL
+        if self.ea is not None:
+            doc.add_heading("1. Isoconversional Analysis", level=1)
+            doc.add_paragraph(f"Method: {self.current_method}")
+            self._add_plot_to_doc(doc, 'Ea')
+            ea_mini = self.ea[['alpha', 'Ea_kJ_per_mol', 'R2']].copy()
+            if len(ea_mini) > 15: ea_mini = ea_mini.iloc[np.linspace(0, len(ea_mini)-1, 15, dtype=int)]
+            self._add_dataframe_to_doc(doc, ea_mini, "Ea Data (Selected Points)")
+
+        # 2. MODEL FITTING HISTORY (Includes ALL models run: KS, GAI, CKA, etc.)
+        if self.fit_history:
+            doc.add_heading("2. Kinetic Model Fitting Results", level=1)
+            for i, result in enumerate(self.fit_history):
+                model_name = result.get('model_name', 'Model')
+                doc.add_heading(f"2.{i+1} {model_name} Fit", level=2)
+                
+                # Parameters
+                params_df = pd.DataFrame([result['params'], result['errors']]).T
+                params_df.columns = ['Value', 'Std.Error']
+                params_df.index.name = 'Parameter'
+                self._add_dataframe_to_doc(doc, params_df, f"Fitted Parameters ({model_name})")
+                
+                # Plot
+                self._add_plot_to_doc(doc, 'ModelFit', data_source=result)
+                doc.add_paragraph("--------------------------------------------------")
+
+        # 3. MECHANISM COMPARISON (Goodness of Fit)
+        if self.mech_ranking is not None:
+            doc.add_heading("3. Mechanism Shape Comparison", level=1)
+            doc.add_paragraph("Comparison of experimental data shape f(α)/f(0.5) against ideal kinetic models.")
+            self._add_plot_to_doc(doc, 'MechComp')
+            self._add_dataframe_to_doc(doc, self.mech_ranking, "Goodness-of-Fit Ranking (R²)")
+
+        # 4. NPA
+        if self.npa_results is not None:
+            doc.add_heading("4. Non-Parametric Analysis (NPA)", level=1)
+            self._add_plot_to_doc(doc, 'NPA')
+            self._add_dataframe_to_doc(doc, self.npa_results.head(10), "NPA Data (Preview)")
+
+        # 5. TG/DTG & DSC
+        if self.tg_dtg_results is not None:
+            doc.add_heading("5. TG/DTG Analysis", level=1)
+            self._add_dataframe_to_doc(doc, self.tg_dtg_results)
+        if self.dsc_results is not None:
+            doc.add_heading("6. DSC Analysis", level=1)
+            self._add_dataframe_to_doc(doc, self.dsc_results)
+
+        # 6. LIFETIME
+        if self.conversion_time_df is not None:
+            doc.add_heading("7. Lifetime Prediction", level=1)
+            if self.last_fitted_model:
+                doc.add_paragraph(f"Based on: {self.last_fitted_model.get('model_name', 'Model')}")
+            self._add_plot_to_doc(doc, 'ConversionTime')
+            self._add_dataframe_to_doc(doc, self.conversion_time_df.head(15), "Predicted Time")
+
+        doc.save(path)
+        return Path(path).name
+        
     def save_latex_report(self):
         # This function remains largely unchanged but is provided for completeness.
         if self.is_task_running: return messagebox.showwarning("Busy", "Please wait for the current task to finish.")
@@ -3381,6 +3651,7 @@ class App(tk.Tk):
         return pd.DataFrame(results).T
 
     def _on_tg_dtg_analysis_success(self, results_df):
+        self.tg_dtg_results = results_df  # <--- SAVE DATA HERE
         self.status_var.set("✓ TG/DTG Parameter Analysis complete.")
         self.show_parameter_table(results_df, "TG/DTG Parameters", lambda: self.plot_tg_dtg(results_df))
 
@@ -3442,9 +3713,10 @@ class App(tk.Tk):
         return {"results_df": pd.DataFrame(results).T, "baselines": baselines}
 
     def _on_dsc_analysis_success(self, data):
+        self.dsc_results = data["results_df"] # <--- SAVE DATA HERE
         self.status_var.set("✓ DSC Parameter Analysis complete.")
         self.show_parameter_table(data["results_df"], "DSC Parameters", lambda: self.plot_dsc(data["results_df"], data["baselines"]))
-
+        
     def show_parameter_table(self, results_df, title, plot_callback):
         win = tk.Toplevel(self); win.title(title); win.geometry("900x500")
         try:
